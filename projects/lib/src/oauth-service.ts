@@ -110,6 +110,7 @@ export class OAuthService extends AuthConfig implements OnDestroy {
 
   protected saveNoncesInLocalStorage = false;
   private document: Document;
+  private focusEventListener: () => void;
 
   constructor(
     protected ngZone: NgZone,
@@ -221,14 +222,40 @@ export class OAuthService extends AuthConfig implements OnDestroy {
     listenTo?: 'access_token' | 'id_token' | 'any',
     noPrompt = true
   ): void {
+    this.focusEventListener = async () => {
+      // When the user is not actively using the application, the token_expires
+      // event might not be fired at the right time, or the refresh request might
+      // have failed. So check if the token is (almost) expired when the user
+      // refocusses the application and trigger the event manually.
+      if (this.shouldRefreshIdToken()) {
+        this.clearIdTokenTimer();
+        this.eventsSubject.next(
+          new OAuthInfoEvent('token_expires', 'id_token')
+        );
+      }
+      if (this.shouldRefreshAccessToken()) {
+        this.clearAccessTokenTimer();
+        this.eventsSubject.next(
+          new OAuthInfoEvent('token_expires', 'access_token')
+        );
+      }
+    };
+
     let shouldRunSilentRefresh = true;
+    let hasFocusEventListenerAdded = false;
     this.events
       .pipe(
         tap(e => {
           if (e.type === 'token_received') {
             shouldRunSilentRefresh = true;
+            if (!hasFocusEventListenerAdded) {
+              window.addEventListener('focus', this.focusEventListener);
+              hasFocusEventListenerAdded = true;
+            }
           } else if (e.type === 'logout') {
             shouldRunSilentRefresh = false;
+            window.removeEventListener('focus', this.focusEventListener);
+            hasFocusEventListenerAdded = false;
           }
         }),
         filter(e => e.type === 'token_expires'),
@@ -250,14 +277,38 @@ export class OAuthService extends AuthConfig implements OnDestroy {
     this.restartRefreshTimerIfStillLoggedIn();
   }
 
-  protected refreshInternal(
+  protected async refreshInternal(
     params,
     noPrompt
   ): Promise<TokenResponse | OAuthEvent> {
-    if (!this.useSilentRefresh && this.responseType === 'code') {
-      return this.refreshToken();
-    } else {
-      return this.silentRefresh(params, noPrompt);
+    const wrapperFun = () => {
+      if (!this.useSilentRefresh && this.responseType === 'code') {
+        return this.refreshToken();
+      } else {
+        return this.silentRefresh(params, noPrompt);
+      }
+    };
+
+    let attempt = 0;
+    let lastError;
+    while (attempt < this.maxRefreshRetries) {
+      // Exponential backoff (scaled to tenths of seconds)
+      const sleepTime = attempt * attempt * 100;
+      await new Promise<void>((resolve) => {
+        setTimeout(() => {
+          resolve();
+        }, sleepTime);
+      });
+      try {
+        return await wrapperFun();
+      } catch (e) {
+        lastError = e;
+        this.debug('Automatic silent refresh failed', e);
+        attempt++;
+      }
+    }
+    if (lastError) {
+      throw lastError;
     }
   }
 
@@ -467,6 +518,22 @@ export class OAuthService extends AuthConfig implements OnDestroy {
     const delta =
       (expiration - storedAt) * this.timeoutFactor - (now - storedAt);
     return Math.max(0, delta);
+  }
+
+  protected shouldRefresh(storedAt: number, expiration: number): boolean {
+    return this.calcTimeout(storedAt, expiration) <= 0;
+  }
+
+  protected shouldRefreshAccessToken(): boolean {
+    const expiration = this.getAccessTokenExpiration();
+    const storedAt = this.getAccessTokenStoredAt();
+    return !isNaN(storedAt) && this.shouldRefresh(storedAt, expiration);
+  }
+
+  protected shouldRefreshIdToken(): boolean {
+    const expiration = this.getIdTokenExpiration();
+    const storedAt = this.getIdTokenStoredAt();
+    return !isNaN(storedAt) && this.shouldRefresh(storedAt, expiration);
   }
 
   /**
